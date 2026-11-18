@@ -297,4 +297,158 @@ class AnimatedGIF
 #define BIGUINT uint32_t
 #endif // 64 vs 32-bit native register size
 
+//
+// Incremental palette codec
+// -------------------------
+// For animated GIFs whose per-frame palettes differ from the global table in
+// only a few entries, storing a full local palette per frame is wasteful.
+// This codec stores a frame's palette relative to a base (global) palette:
+//   - no change    : a 1-byte marker, the active palette stays as-is
+//   - delta record : a list of (index, RGB888) entries applied as updates
+//   - full record  : the whole palette, used when a delta would be larger
+// Decoding always reproduces the exact frame palette (lossless, byte-for-byte).
+//
+// Record layout (all multi-byte fields are little-endian):
+//   byte 0: mode
+//     GIF_INCPAL_UNCHANGED (0x00) -> no further bytes
+//     GIF_INCPAL_DELTA     (0x01) -> uint16 count, count * (1 index + 3 RGB)
+//     GIF_INCPAL_FULL      (0x02) -> entryCount * 3 RGB bytes
+//
+// Fallback rule: a delta record costs 3 + 4*changed bytes while a full
+// record costs 1 + 3*entryCount bytes. The encoder switches to the full
+// record as soon as the delta is not strictly smaller, i.e. when
+// 4*changed >= 3*entryCount (changed >= 75% of the entries); equality
+// prefers the full table, which also keeps the record self-contained.
+//
+#define GIF_INCPAL_UNCHANGED 0x00
+#define GIF_INCPAL_DELTA     0x01
+#define GIF_INCPAL_FULL      0x02
+
+// Upper bound on any record the encoder can emit for entryCount entries.
+#define GIF_INCPAL_MAX_RECORD_BYTES(entryCount) (1 + 3 * (entryCount))
+
+// Return codes for the incremental palette functions.
+enum {
+    GIF_INCPAL_OK = 0,
+    GIF_INCPAL_BAD_PARAMETER,
+    GIF_INCPAL_BAD_RECORD,
+    GIF_INCPAL_BUFFER_TOO_SMALL
+};
+
+// Count entries that differ (byte-for-byte) between two RGB888 palettes.
+// Returns 0 for invalid arguments.
+static inline int GIF_incPalCountChanges(const uint8_t *pBase, const uint8_t *pFrame,
+                                         int iEntryCount)
+{
+    int i, iChanges = 0;
+    if (pBase == NULL || pFrame == NULL || iEntryCount <= 0 || iEntryCount > MAX_COLORS)
+        return 0;
+    for (i = 0; i < iEntryCount; i++) {
+        if (memcmp(&pBase[i * 3], &pFrame[i * 3], 3) != 0)
+            iChanges++;
+    }
+    return iChanges;
+} /* GIF_incPalCountChanges() */
+
+//
+// Encode pFrame's palette relative to pBase into pOut.
+// Returns the record length in bytes, or a GIF_INCPAL_* error code (negative).
+//
+static inline int GIF_incPalEncode(const uint8_t *pBase, const uint8_t *pFrame,
+                                   int iEntryCount, uint8_t *pOut, int iOutSize)
+{
+    int i, iChanges, iLen;
+    if (pBase == NULL || pFrame == NULL || pOut == NULL || iOutSize <= 0 ||
+        iEntryCount <= 0 || iEntryCount > MAX_COLORS)
+        return GIF_INCPAL_BAD_PARAMETER;
+    iChanges = GIF_incPalCountChanges(pBase, pFrame, iEntryCount);
+    if (iChanges == 0) {
+        pOut[0] = GIF_INCPAL_UNCHANGED;
+        return 1;
+    }
+    // Fallback when the delta would not be smaller than a full table.
+    if ((4 * iChanges) >= (3 * iEntryCount)) {
+        iLen = 1 + 3 * iEntryCount;
+        if (iOutSize < iLen)
+            return GIF_INCPAL_BUFFER_TOO_SMALL;
+        pOut[0] = GIF_INCPAL_FULL;
+        memcpy(&pOut[1], pFrame, (size_t)(3 * iEntryCount));
+        return iLen;
+    }
+    iLen = 3 + 4 * iChanges;
+    if (iOutSize < iLen)
+        return GIF_INCPAL_BUFFER_TOO_SMALL;
+    pOut[0] = GIF_INCPAL_DELTA;
+    pOut[1] = (uint8_t)(iChanges & 0xff);
+    pOut[2] = (uint8_t)((iChanges >> 8) & 0xff);
+    iLen = 3;
+    for (i = 0; i < iEntryCount; i++) {
+        if (memcmp(&pBase[i * 3], &pFrame[i * 3], 3) != 0) {
+            pOut[iLen++] = (uint8_t)i;
+            memcpy(&pOut[iLen], &pFrame[i * 3], 3);
+            iLen += 3;
+        }
+    }
+    return iLen;
+} /* GIF_incPalEncode() */
+
+//
+// Apply a record in-place: pPalette must already hold the base palette for
+// UNCHANGED/DELTA records (the decoder keeps it across frames); a FULL record
+// overwrites every entry. Returns GIF_INCPAL_OK or an error code.
+//
+static inline int GIF_incPalApply(uint8_t *pPalette, int iEntryCount,
+                                  const uint8_t *pRecord, int iRecordLen)
+{
+    int i, iCount, iOff;
+    if (pPalette == NULL || pRecord == NULL || iRecordLen <= 0 ||
+        iEntryCount <= 0 || iEntryCount > MAX_COLORS)
+        return GIF_INCPAL_BAD_PARAMETER;
+    if (pRecord[0] == GIF_INCPAL_UNCHANGED)
+        return GIF_INCPAL_OK;
+    if (pRecord[0] == GIF_INCPAL_FULL) {
+        if (iRecordLen < 1 + 3 * iEntryCount)
+            return GIF_INCPAL_BAD_RECORD;
+        memcpy(pPalette, &pRecord[1], (size_t)(3 * iEntryCount));
+        return GIF_INCPAL_OK;
+    }
+    if (pRecord[0] != GIF_INCPAL_DELTA || iRecordLen < 3)
+        return GIF_INCPAL_BAD_RECORD;
+    iCount = pRecord[1] | (pRecord[2] << 8);
+    if (iCount <= 0 || iRecordLen < 3 + 4 * iCount)
+        return GIF_INCPAL_BAD_RECORD;
+    iOff = 3;
+    for (i = 0; i < iCount; i++) {
+        int iIndex = pRecord[iOff];
+        if (iIndex >= iEntryCount)
+            return GIF_INCPAL_BAD_RECORD;
+        memcpy(&pPalette[iIndex * 3], &pRecord[iOff + 1], 3);
+        iOff += 4;
+    }
+    return GIF_INCPAL_OK;
+} /* GIF_incPalApply() */
+
+//
+// Decode a record into a separate output buffer. pBase supplies the entries
+// that a delta does not touch (and is copied out first); a FULL record
+// ignores the base. The output is the exact frame palette.
+//
+static inline int GIF_incPalDecode(const uint8_t *pBase, int iEntryCount,
+                                   const uint8_t *pRecord, int iRecordLen,
+                                   uint8_t *pOut)
+{
+    int rc;
+    if (pOut == NULL || iEntryCount <= 0 || iEntryCount > MAX_COLORS)
+        return GIF_INCPAL_BAD_PARAMETER;
+    if (pRecord == NULL || iRecordLen <= 0)
+        return GIF_INCPAL_BAD_PARAMETER;
+    if (pRecord[0] != GIF_INCPAL_FULL) {
+        if (pBase == NULL)
+            return GIF_INCPAL_BAD_PARAMETER;
+        memcpy(pOut, pBase, (size_t)(3 * iEntryCount));
+    }
+    rc = GIF_incPalApply(pOut, iEntryCount, pRecord, iRecordLen);
+    return rc;
+} /* GIF_incPalDecode() */
+
 #endif // __ANIMATEDGIF__
