@@ -1,0 +1,74 @@
+[downscale 2x   (320x240 -> 160x120)]  frames=8  src=320x240  dst=160x120
+  mode=AUTO(area/nn)  out=160x120  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=1164
+    decode/frame:   avg=0.358 ms  max=0.422 ms
+    resample/frame: avg=0.276 ms  max=0.330 ms  (scratch=230400 bytes)
+  mode=NEAREST        out=160x120  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=80
+    decode/frame:   avg=0.358 ms  max=0.422 ms
+    resample/frame: avg=0.042 ms  max=0.043 ms  (scratch=0 bytes)
+[downscale 4x   (320x240 ->  80x60)]  frames=8  src=320x240  dst=80x60
+  mode=AUTO(area/nn)  out=80x60  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=422
+    decode/frame:   avg=0.358 ms  max=0.381 ms
+    resample/frame: avg=0.198 ms  max=0.221 ms  (scratch=115200 bytes)
+  mode=NEAREST        out=80x60  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=40
+    decode/frame:   avg=0.358 ms  max=0.381 ms
+    resample/frame: avg=0.011 ms  max=0.011 ms  (scratch=0 bytes)
+[upscale   2x   (160x120 -> 320x240)]  frames=8  src=160x120  dst=320x240
+  mode=AUTO(area/nn)  out=320x240  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=168
+    decode/frame:   avg=0.094 ms  max=0.111 ms
+    resample/frame: avg=0.165 ms  max=0.169 ms  (scratch=0 bytes)
+  mode=NEAREST        out=320x240  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=168
+    decode/frame:   avg=0.094 ms  max=0.111 ms
+    resample/frame: avg=0.165 ms  max=0.167 ms  (scratch=0 bytes)
+[non-integer    (300x200 -> 176x132)]  frames=8  src=300x200  dst=176x132
+  mode=AUTO(area/nn)  out=176x132  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=15381
+    decode/frame:   avg=0.279 ms  max=0.296 ms
+    resample/frame: avg=0.308 ms  max=0.347 ms  (scratch=211200 bytes)
+  mode=NEAREST        out=176x132  frames=8  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=168
+    decode/frame:   avg=0.279 ms  max=0.296 ms
+    resample/frame: avg=0.050 ms  max=0.050 ms  (scratch=0 bytes)
+[perf down 2x   (640x480 ->  320x240)]  frames=4  src=640x480  dst=320x240
+  mode=AUTO(area/nn)  out=320x240  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=1074
+    decode/frame:   avg=1.451 ms  max=1.571 ms
+    resample/frame: avg=1.120 ms  max=1.270 ms  (scratch=921600 bytes)
+  mode=NEAREST        out=320x240  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=80
+    decode/frame:   avg=1.451 ms  max=1.571 ms
+    resample/frame: avg=0.167 ms  max=0.167 ms  (scratch=0 bytes)
+[perf down 4x   (640x480 ->  160x120)]  frames=4  src=640x480  dst=160x120
+  mode=AUTO(area/nn)  out=160x120  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=330
+    decode/frame:   avg=2.160 ms  max=2.253 ms
+    resample/frame: avg=0.864 ms  max=1.010 ms  (scratch=460800 bytes)
+  mode=NEAREST        out=160x120  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=40
+    decode/frame:   avg=2.160 ms  max=2.253 ms
+    resample/frame: avg=0.068 ms  max=0.119 ms  (scratch=0 bytes)
+[perf up   2x   (640x480 -> 1280x960)]  frames=4  src=640x480  dst=1280x960
+  mode=AUTO(area/nn)  out=1280x960  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=168
+    decode/frame:   avg=1.506 ms  max=1.644 ms
+    resample/frame: avg=2.723 ms  max=2.759 ms  (scratch=0 bytes)
+  mode=NEAREST        out=1280x960  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=168
+    decode/frame:   avg=1.506 ms  max=1.644 ms
+    resample/frame: avg=2.710 ms  max=2.905 ms  (scratch=0 bytes)
+[perf non-int   (640x480 ->  400x300)]  frames=4  src=640x480  dst=400x300
+  mode=AUTO(area/nn)  out=400x300  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=3857
+    decode/frame:   avg=1.477 ms  max=1.582 ms
+    resample/frame: avg=1.616 ms  max=1.853 ms  (scratch=1152000 bytes)
+  mode=NEAREST        out=400x300  frames=4  pixel-identical=YES
+    colors: src(max/frame)=168  resampled(max/frame)=168
+    decode/frame:   avg=1.477 ms  max=1.582 ms
+    resample/frame: avg=0.259 ms  max=0.262 ms  (scratch=0 bytes)
+
+ALL CHECKS PASSED
