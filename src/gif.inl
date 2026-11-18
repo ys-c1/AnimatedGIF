@@ -43,6 +43,60 @@ static int DecodeLZWTurbo(GIFIMAGE *pImage, int iOptions);
 static int32_t readMem(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen);
 static int32_t seekMem(GIFFILE *pFile, int32_t iPosition);
 int GIF_getInfo(GIFIMAGE *pPage, GIFINFO *pInfo);
+
+//
+// Optional internal disposal-method compositor (opt-in, additive API)
+//
+// GIF89a frame disposal methods:
+//   0 = no disposal specified (handled like 1)
+//   1 = do not dispose (leave the frame in place)
+//   2 = restore to background color
+//   3 = restore to previous (the canvas state before the frame was drawn)
+//
+// Its state hangs off GIFIMAGE.pPixels, a pointer field that is not used
+// anywhere else in the decoder. That keeps the public structure layout and
+// the behavior of every existing entry point unchanged: all compositor hooks
+// are no-ops unless GIF_beginComposite() has been called.
+//
+typedef struct gif_composite_tag {
+    uint8_t *pCanvas;   // fully composited canvas (8-bit palette indices)
+    uint8_t *pFrame;    // most recently decoded frame, in canvas-row order
+    uint8_t *pRestore;  // saved canvas snapshot for disposal method 3
+    int iWidth, iHeight; // canvas dimensions
+    uint16_t iPrevX, iPrevY, iPrevW, iPrevH; // geometry of the previous frame
+    uint8_t ucBackground;  // background color index
+    uint8_t ucPrevDisp;    // disposal method of the previous frame
+    uint8_t bRestoreValid; // pRestore holds a usable snapshot
+} GIFCOMPOSITE;
+
+// Store one fully decoded frame line; called from both LZW decoders
+static void GIFCompositeStoreLine(GIFIMAGE *pGIF, int iY, const uint8_t *pPixels)
+{
+    GIFCOMPOSITE *pComp = (GIFCOMPOSITE *)pGIF->pPixels;
+    if (pComp)
+        memcpy(&pComp->pFrame[iY * pGIF->iWidth], pPixels, pGIF->iWidth);
+} /* GIFCompositeStoreLine() */
+
+// Map an interlaced storage row to its display row (same math as the draw path)
+static int GIFInterlaceRow(int iY, int iHeight)
+{
+    int h = iHeight - 1;
+    if (iY > h / 2)
+        return iY * 2 - (h | 1);
+    else if (iY > h / 4)
+        return iY * 4 - ((iHeight & ~1) | 2);
+    else if (iY > h / 8)
+        return iY * 8 - ((iHeight & ~3) | 4);
+    return iY * 8;
+} /* GIFInterlaceRow() */
+
+// Public compositor entry points (definitions at the end of this file).
+// Kept here, rather than in AnimatedGIF.h, so the entire feature lives in a
+// single library source file; they are additive and change no existing API.
+int GIF_beginComposite(GIFIMAGE *pGIF);
+void GIF_endComposite(GIFIMAGE *pGIF);
+uint8_t *GIF_getCompositeCanvas(GIFIMAGE *pGIF);
+void GIF_compositeFrame(GIFIMAGE *pGIF);
 #if defined( PICO_BUILD ) || defined( __LINUX__ ) || defined( __MCUXPRESSO )
 static int32_t readFile(GIFFILE *pFile, uint8_t *pBuf, int32_t iLen);
 static int32_t seekFile(GIFFILE *pFile, int32_t iPosition);
@@ -1292,6 +1346,11 @@ uint16_t *pLengths;
     (void)iOptions;
     pImage->iYCount = pImage->iHeight; // count down the lines
     pImage->iXCount = pImage->iWidth;
+    // The non-Turbo path derives the disposal method per decoded line; the
+    // Turbo path only reaches that code in the optional cooked-output block.
+    // Set it up front so it is correct for every draw type (RAW included)
+    // and for the internal disposal compositor.
+    pImage->ucDisposalMethod = (pImage->ucGIFBits & 0x1c) >> 2;
     bitnum = 0;
     pHighWater = pImage->ucLZW + LZW_HIGHWATER_TURBO;
     pImage->iLZWOff = 0; // Offset into compressed data
@@ -1366,6 +1425,13 @@ init_codetable:
             GET_CODE_TURBO
         } /* while not end of LZW code stream */
     } // while not end of frame
+    if (pImage->pPixels) { // internal disposal compositor: keep the decoded frame in display-row order
+        int iW = pImage->iWidth, iH = pImage->iHeight;
+        for (int y=0; y<iH; y++) {
+            int iRow = (pImage->ucMap & 0x40) ? GIFInterlaceRow(y, iH) : y;
+            GIFCompositeStoreLine(pImage, iRow, &buf[y * iW]);
+        }
+    }
     if (pImage->ucDrawType == GIF_DRAW_COOKED && pImage->pFrameBuffer) { // convert each line through the palette
         GIFDRAW gd;
         uint32_t *pPal32 = NULL;
@@ -1513,6 +1579,8 @@ static void GIFMakePels(GIFIMAGE *pPage, unsigned int code)
                else
                   gd.y = gd.y * 8;
             }
+            if (pPage->pPixels) // internal disposal compositor: save the completed line
+                GIFCompositeStoreLine(pPage, gd.y, pPage->pLineBufAligned);
             pPage->ucDisposalMethod = gd.ucDisposalMethod = (pPage->ucGIFBits & 0x1c)>>2;
             gd.ucTransparent = pPage->ucTransparent;
             gd.ucHasTransparency = pPage->ucGIFBits & 1;
@@ -1732,5 +1800,170 @@ const uint32_t RBMask = 0xf81f, GMask = 0x7e0;
          *d++ = (uint16_t)(gSum + rbSum); // store finished pixel
    } // for x
 } /* GIF_scaleHalf() */
+
+//
+// ===========================================================================
+// Internal disposal-method compositor (opt-in, additive public API)
+//
+// The decoder itself only reports each frame's ucDisposalMethod in the
+// GIFDRAW structure; applying GIF89a disposal semantics to a persistent
+// canvas was left to the caller. These entry points maintain an internal
+// 8-bit palette-index canvas instead, so after GIF_compositeFrame() the
+// caller always receives the fully rendered frame.
+//
+// Typical use:
+//
+//   GIF_begin(&gif, GIF_PALETTE_RGB565_LE);
+//   GIF_openRAM(&gif, data, size, MyDrawCallback); // callback is optional now
+//   GIF_beginComposite(&gif);                      // turn on compositing
+//   while (GIF_playFrame(&gif, &delay, NULL))
+//       GIF_compositeFrame(&gif);                  // one call per played frame
+//   pCanvas = GIF_getCompositeCanvas(&gif);        // final frame, 1 byte/pixel
+//   GIF_endComposite(&gif);
+//
+// No existing entry point changes behavior; all compositor code paths are
+// inactive until GIF_beginComposite() succeeds.
+// ===========================================================================
+//
+
+//
+// Enable the compositor on an already opened GIF.
+// Allocates the canvas, a single-frame buffer and a restore snapshot
+// (3 x canvas width x height + small header).
+// Returns GIF_SUCCESS, GIF_INVALID_PARAMETER or GIF_ERROR_MEMORY.
+//
+int GIF_beginComposite(GIFIMAGE *pGIF)
+{
+    int iCanvasSize;
+    GIFCOMPOSITE *pComp;
+
+    if (pGIF == NULL || pGIF->iCanvasWidth == 0 || pGIF->iCanvasHeight == 0)
+        return GIF_INVALID_PARAMETER;
+    if (pGIF->pPixels != NULL) // already active
+        return GIF_INVALID_PARAMETER;
+    pComp = (GIFCOMPOSITE *)calloc(1, sizeof(GIFCOMPOSITE));
+    if (pComp == NULL)
+        return GIF_ERROR_MEMORY;
+    iCanvasSize = pGIF->iCanvasWidth * pGIF->iCanvasHeight;
+    pComp->pCanvas = (uint8_t *)malloc((size_t)iCanvasSize * 3);
+    if (pComp->pCanvas == NULL) {
+        free(pComp);
+        return GIF_ERROR_MEMORY;
+    }
+    pComp->pFrame = pComp->pCanvas + iCanvasSize;
+    pComp->pRestore = pComp->pFrame + iCanvasSize;
+    pComp->iWidth = pGIF->iCanvasWidth;
+    pComp->iHeight = pGIF->iCanvasHeight;
+    pComp->ucBackground = pGIF->ucBackground;
+    // The initial logical screen is filled with the background color
+    memset(pComp->pCanvas, pComp->ucBackground, iCanvasSize);
+    pComp->ucPrevDisp = 0;
+    pComp->bRestoreValid = 0;
+    pGIF->pPixels = (unsigned char *)pComp;
+    return GIF_SUCCESS;
+} /* GIF_beginComposite() */
+
+//
+// Stop compositing and release every buffer owned by the compositor.
+// The GIF itself stays open and usable.
+//
+void GIF_endComposite(GIFIMAGE *pGIF)
+{
+    GIFCOMPOSITE *pComp;
+
+    if (pGIF == NULL)
+        return;
+    pComp = (GIFCOMPOSITE *)pGIF->pPixels;
+    if (pComp == NULL)
+        return;
+    if (pComp->pCanvas)
+        free(pComp->pCanvas);
+    free(pComp);
+    pGIF->pPixels = NULL;
+} /* GIF_endComposite() */
+
+//
+// Return the composited canvas (one palette index per pixel, canvas width
+// pitched) or NULL if the compositor is not active.
+//
+uint8_t *GIF_getCompositeCanvas(GIFIMAGE *pGIF)
+{
+    GIFCOMPOSITE *pComp;
+
+    if (pGIF == NULL)
+        return NULL;
+    pComp = (GIFCOMPOSITE *)pGIF->pPixels;
+    return pComp ? pComp->pCanvas : NULL;
+} /* GIF_getCompositeCanvas() */
+
+//
+// Apply one decoded frame to the internal canvas. Must be called exactly
+// once after every successful GIF_playFrame() (including the final one).
+// The frame pixels were captured by the decoder while the compositor is
+// active, so no draw callback or user frame buffer is required.
+//
+void GIF_compositeFrame(GIFIMAGE *pGIF)
+{
+    int x, y, iX, iY, iW, iH, iPitch;
+    uint8_t ucTrans, ucBG;
+    GIFCOMPOSITE *pComp;
+
+    if (pGIF == NULL)
+        return;
+    pComp = (GIFCOMPOSITE *)pGIF->pPixels;
+    if (pComp == NULL)
+        return;
+    iPitch = pComp->iWidth;
+    iX = pGIF->iX;
+    iY = pGIF->iY;
+    iW = pGIF->iWidth;
+    iH = pGIF->iHeight;
+    ucBG = pGIF->ucBackground;
+
+    // 1) Apply the PREVIOUS frame's disposal method before drawing the new one
+    if (pComp->ucPrevDisp == 2 && pComp->iPrevW > 0 && pComp->iPrevH > 0) {
+        // Restore the previous frame's rectangle to the background color
+        for (y = pComp->iPrevY; y < pComp->iPrevY + pComp->iPrevH; y++)
+            memset(&pComp->pCanvas[y * iPitch + pComp->iPrevX], ucBG, pComp->iPrevW);
+    } else if (pComp->ucPrevDisp == 3 && pComp->bRestoreValid &&
+               pComp->iPrevW > 0 && pComp->iPrevH > 0) {
+        // Restore the previous frame's rectangle to what was there before it
+        for (y = pComp->iPrevY; y < pComp->iPrevY + pComp->iPrevH; y++)
+            memcpy(&pComp->pCanvas[y * iPitch + pComp->iPrevX],
+                   &pComp->pRestore[y * iPitch + pComp->iPrevX], pComp->iPrevW);
+    }
+
+    // 2) If THIS frame asks to be restored later, snapshot its rectangle first
+    if (pGIF->ucDisposalMethod == 3) {
+        for (y = iY; y < iY + iH; y++)
+            memcpy(&pComp->pRestore[y * iPitch + iX],
+                   &pComp->pCanvas[y * iPitch + iX], iW);
+        pComp->bRestoreValid = 1;
+    }
+
+    // 3) Merge the new frame: transparent indices keep the current canvas
+    if (pGIF->ucGIFBits & 1) { // frame has a transparent color
+        ucTrans = pGIF->ucTransparent;
+        for (y = 0; y < iH; y++) {
+            const uint8_t *pSrc = &pComp->pFrame[y * iW];
+            uint8_t *pDst = &pComp->pCanvas[(iY + y) * iPitch + iX];
+            for (x = 0; x < iW; x++) {
+                if (pSrc[x] != ucTrans)
+                    pDst[x] = pSrc[x];
+            }
+        }
+    } else { // fully opaque frame
+        for (y = 0; y < iH; y++)
+            memcpy(&pComp->pCanvas[(iY + y) * iPitch + iX],
+                   &pComp->pFrame[y * iW], iW);
+    }
+
+    // 4) Remember this frame's geometry/disposal for the next call
+    pComp->ucPrevDisp = pGIF->ucDisposalMethod;
+    pComp->iPrevX = iX;
+    pComp->iPrevY = iY;
+    pComp->iPrevW = iW;
+    pComp->iPrevH = iH;
+} /* GIF_compositeFrame() */
 
 
