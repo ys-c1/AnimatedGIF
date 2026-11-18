@@ -1733,4 +1733,680 @@ const uint32_t RBMask = 0xf81f, GMask = 0x7e0;
    } // for x
 } /* GIF_scaleHalf() */
 
+//===========================================================================
+// RGB888 color quantization for GIF palette generation
+// Written for the AnimatedGIF palette pipeline.
+//
+// A GIF local/global color table can hold at most 256 entries, but source
+// images (e.g. JPEG photos decoded to RGB888) can contain thousands of
+// distinct colors. The functions below reduce an RGB888 bitmap to an
+// indexed image with a configurable palette size limit using:
+//   1. a distinct-color histogram (open-addressing hash table)
+//   2. median cut partitioning (weighted by pixel population)
+//   3. an optional Floyd-Steinberg error-diffusion dither pass
+//   4. a quantization error report (MSE / PSNR / mean color difference)
+//
+// The output palette is a sequence of RGB888 triplets (R,G,B,R,G,B,...),
+// exactly the byte layout of a GIF color table, so it can be fed directly
+// into the existing GIF palette flow (GIF_PALETTE_RGB888).
+//
+// No dynamic allocation is required from the caller; all working memory is
+// malloc'd internally and released before returning.
+//===========================================================================
+// math.h is available on every target this library supports (ESP32, RP2040,
+// ARM Cortex-M, AVR, Linux, macOS); sqrt()/log10() back the error report.
+#include <math.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define GIF_Q_LUT_BITS 5                        // 5 bits per channel lookup grid
+#define GIF_Q_LUT_SIZE (1 << GIF_Q_LUT_BITS)    // 32 cells per axis
+#define GIF_Q_LUT_CELLS (GIF_Q_LUT_SIZE * GIF_Q_LUT_SIZE * GIF_Q_LUT_SIZE) // 32768
+#define GIF_Q_LUT_CAND 4                        // nearest candidates kept per cell
+#define GIF_Q_HASH_MAX (1 << 19)                // cap hash table at 512K entries
+
+typedef struct gif_quant_stats_tag
+{
+    int iPaletteCount;   // number of palette entries actually produced (>=1, <= iMaxColors)
+    int iUsedColors;     // distinct palette indices actually referenced by the output
+    int iDistinctInput;  // distinct RGB888 colors present in the source image
+    int bDithered;       // 1 if Floyd-Steinberg dithering was applied, 0 otherwise
+    double dMSE;         // mean squared error, averaged over R,G,B channels (0 = lossless)
+    double dPSNR;        // peak signal-to-noise ratio in dB (99.99 when MSE == 0)
+    double dMeanDeltaE;  // mean per-pixel Euclidean RGB distance (sqrt of sum of squared deltas)
+} GIF_QUANT_STATS;
+
+typedef struct gif_qcolor_tag
+{
+    uint8_t r, g, b, pad;
+    uint32_t u32Count; // number of source pixels with this exact color
+} gif_qcolor;
+
+typedef struct gif_qbox_tag
+{
+    int iStart, iCount;          // slice of the gif_qcolor working array
+    int iMin[3], iMax[3];        // per-channel range (0=R,1=G,2=B)
+    uint32_t u32Pixels;          // total pixel population of the box
+} gif_qbox;
+
+//
+// Pack/unpack RGB triplets into a 24-bit key
+//
+static inline uint32_t gif_q_key(uint8_t r, uint8_t g, uint8_t b)
+{
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+}
+static inline uint8_t gif_q_r(uint32_t u32Key) { return (uint8_t)(u32Key >> 16); }
+static inline uint8_t gif_q_g(uint32_t u32Key) { return (uint8_t)(u32Key >> 8); }
+static inline uint8_t gif_q_b(uint32_t u32Key) { return (uint8_t)u32Key; }
+
+static inline uint8_t gif_q_channel(const gif_qcolor *pC, int iCh)
+{
+    if (iCh == 0) return pC->r;
+    if (iCh == 1) return pC->g;
+    return pC->b;
+}
+
+//
+// In-place partition of a color slice: values strictly below iValue go left,
+// the rest go right. Returns the left-side count.
+//
+static int gif_q_partition(gif_qcolor *pColors, int iStart, int iCount, int iCh, int iValue)
+{
+    int i = iStart, j = iStart + iCount - 1;
+    gif_qcolor tmp;
+    while (i <= j)
+    {
+        while (i <= j && gif_q_channel(&pColors[i], iCh) < iValue)
+            i++;
+        while (i <= j && gif_q_channel(&pColors[j], iCh) >= iValue)
+            j--;
+        if (i < j)
+        {
+            tmp = pColors[i]; pColors[i] = pColors[j]; pColors[j] = tmp;
+            i++; j--;
+        }
+    }
+    return i - iStart; // number of elements on the left
+}
+
+//
+// Recompute the per-channel range and pixel population of a box.
+//
+static void gif_q_measure(gif_qbox *pBox, const gif_qcolor *pColors)
+{
+    int i;
+    pBox->iMin[0] = pBox->iMin[1] = pBox->iMin[2] = 255;
+    pBox->iMax[0] = pBox->iMax[1] = pBox->iMax[2] = 0;
+    pBox->u32Pixels = 0;
+    for (i = 0; i < pBox->iCount; i++)
+    {
+        const gif_qcolor *pC = &pColors[pBox->iStart + i];
+        pBox->u32Pixels += pC->u32Count;
+        if (pC->r < pBox->iMin[0]) pBox->iMin[0] = pC->r;
+        if (pC->r > pBox->iMax[0]) pBox->iMax[0] = pC->r;
+        if (pC->g < pBox->iMin[1]) pBox->iMin[1] = pC->g;
+        if (pC->g > pBox->iMax[1]) pBox->iMax[1] = pC->g;
+        if (pC->b < pBox->iMin[2]) pBox->iMin[2] = pC->b;
+        if (pC->b > pBox->iMax[2]) pBox->iMax[2] = pC->b;
+    }
+}
+
+//
+// Per-cell candidate list: the GIF_Q_LUT_CAND nearest palette seeds by
+// weighted Manhattan grid distance. The pixel mapper breaks ties with an
+// exact Euclidean distance over only these candidates.
+//
+typedef struct gif_q_cand_tag
+{
+    int16_t aiIdx[GIF_Q_LUT_CAND];
+    int32_t aiDist[GIF_Q_LUT_CAND];
+} gif_q_cand;
+
+// Merge a neighbor's candidate list into this cell's list, adding the
+// neighbor step weight and keeping the GIF_Q_LUT_CAND closest distinct seeds.
+static inline void gif_q_cand_merge(gif_q_cand *pDst, const gif_q_cand *pSrc,
+                                    int32_t i32Step)
+{
+    int k;
+    for (k = 0; k < GIF_Q_LUT_CAND; k++)
+    {
+        int16_t iIdx = pSrc->aiIdx[k];
+        int32_t i32D = pSrc->aiDist[k] + i32Step;
+        int j, iSlot;
+        if (pSrc->aiDist[k] == 0x3fffffff)
+            continue; // unused neighbor slot
+        // skip a seed already represented in the destination list
+        for (j = 0; j < GIF_Q_LUT_CAND; j++)
+        {
+            if (pDst->aiDist[j] != 0x3fffffff && pDst->aiIdx[j] == iIdx)
+                break;
+        }
+        if (j < GIF_Q_LUT_CAND)
+            continue;
+        // find the first slot worse than this candidate
+        iSlot = GIF_Q_LUT_CAND;
+        for (j = 0; j < GIF_Q_LUT_CAND; j++)
+        {
+            if (i32D < pDst->aiDist[j]) { iSlot = j; break; }
+        }
+        if (iSlot < GIF_Q_LUT_CAND)
+        {
+            for (j = GIF_Q_LUT_CAND - 1; j > iSlot; j--)
+            {
+                pDst->aiIdx[j] = pDst->aiIdx[j - 1];
+                pDst->aiDist[j] = pDst->aiDist[j - 1];
+            }
+            pDst->aiIdx[iSlot] = iIdx;
+            pDst->aiDist[iSlot] = i32D;
+        }
+    }
+}
+
+//
+// Fill the 5-bits/channel nearest-palette lookup grid. Seeds occupy their
+// own cell; a three-axis, two-pass distance transform then propagates the
+// closest few palette indices to every cell using weighted Manhattan
+// distance (Rec.601 luma weights). O(cells) overall.
+//
+static void gif_q_build_lut(const uint8_t *pPalette, int iPaletteCount,
+                            gif_q_cand *pLut)
+{
+    int i, z, y, x;
+    const int32_t iInf = 0x3fffffff;
+
+    for (i = 0; i < GIF_Q_LUT_CELLS; i++)
+    {
+        int k;
+        for (k = 0; k < GIF_Q_LUT_CAND; k++)
+        {
+            pLut[i].aiIdx[k] = 0;
+            pLut[i].aiDist[k] = iInf;
+        }
+    }
+    for (i = 0; i < iPaletteCount; i++)
+    {
+        int r = pPalette[i * 3] >> 3;
+        int g = pPalette[i * 3 + 1] >> 3;
+        int b = pPalette[i * 3 + 2] >> 3;
+        int iCell = (r << (2 * GIF_Q_LUT_BITS)) | (g << GIF_Q_LUT_BITS) | b;
+        // A seed goes into the first free slot of its own cell (distance 0).
+        if (pLut[iCell].aiDist[0] != 0)
+        {
+            pLut[iCell].aiIdx[0] = (int16_t)i;
+            pLut[iCell].aiDist[0] = 0;
+        }
+        else
+        {
+            int k;
+            for (k = 1; k < GIF_Q_LUT_CAND; k++)
+            {
+                if (pLut[iCell].aiDist[k] == iInf)
+                {
+                    pLut[iCell].aiIdx[k] = (int16_t)i;
+                    pLut[iCell].aiDist[k] = 0;
+                    break;
+                }
+            }
+        }
+    }
+    // B axis: stride 1, step weight 11
+    for (z = 0; z < GIF_Q_LUT_SIZE; z++)
+    {
+        for (y = 0; y < GIF_Q_LUT_SIZE; y++)
+        {
+            int iBase = (z * GIF_Q_LUT_SIZE + y) * GIF_Q_LUT_SIZE;
+            for (x = 1; x < GIF_Q_LUT_SIZE; x++)
+                gif_q_cand_merge(&pLut[iBase + x], &pLut[iBase + x - 1], 11);
+            for (x = GIF_Q_LUT_SIZE - 2; x >= 0; x--)
+                gif_q_cand_merge(&pLut[iBase + x], &pLut[iBase + x + 1], 11);
+        }
+    }
+    // G axis: stride 32, step weight 59
+    for (z = 0; z < GIF_Q_LUT_SIZE; z++)
+    {
+        for (x = 0; x < GIF_Q_LUT_SIZE; x++)
+        {
+            int iBase = z * GIF_Q_LUT_SIZE * GIF_Q_LUT_SIZE + x;
+            for (y = 1; y < GIF_Q_LUT_SIZE; y++)
+                gif_q_cand_merge(&pLut[iBase + y * GIF_Q_LUT_SIZE],
+                                 &pLut[iBase + (y - 1) * GIF_Q_LUT_SIZE], 59);
+            for (y = GIF_Q_LUT_SIZE - 2; y >= 0; y--)
+                gif_q_cand_merge(&pLut[iBase + y * GIF_Q_LUT_SIZE],
+                                 &pLut[iBase + (y + 1) * GIF_Q_LUT_SIZE], 59);
+        }
+    }
+    // R axis: stride 1024, step weight 30
+    for (y = 0; y < GIF_Q_LUT_SIZE; y++)
+    {
+        for (x = 0; x < GIF_Q_LUT_SIZE; x++)
+        {
+            int iBase = y * GIF_Q_LUT_SIZE + x;
+            for (z = 1; z < GIF_Q_LUT_SIZE; z++)
+                gif_q_cand_merge(&pLut[iBase + z * GIF_Q_LUT_SIZE * GIF_Q_LUT_SIZE],
+                                 &pLut[iBase + (z - 1) * GIF_Q_LUT_SIZE * GIF_Q_LUT_SIZE], 30);
+            for (z = GIF_Q_LUT_SIZE - 2; z >= 0; z--)
+                gif_q_cand_merge(&pLut[iBase + z * GIF_Q_LUT_SIZE * GIF_Q_LUT_SIZE],
+                                 &pLut[iBase + (z + 1) * GIF_Q_LUT_SIZE * GIF_Q_LUT_SIZE], 30);
+        }
+    }
+} /* gif_q_build_lut() */
+
+//
+// Pick the palette entry with the smallest exact Euclidean distance to the
+// given (already clamped) RGB value, considering only a cell's candidates.
+//
+static inline int gif_q_nearest(const gif_q_cand *pLut, int iCell,
+                                const uint8_t *pPalette,
+                                int r, int g, int b)
+{
+    int k;
+    int iBest = pLut[iCell].aiIdx[0];
+    int32_t iBestD = 0x7fffffff;
+    for (k = 0; k < GIF_Q_LUT_CAND; k++)
+    {
+        int iIdx = pLut[iCell].aiIdx[k];
+        int dr = r - pPalette[iIdx * 3];
+        int dg = g - pPalette[iIdx * 3 + 1];
+        int db = b - pPalette[iIdx * 3 + 2];
+        int32_t iD = dr * dr + dg * dg + db * db;
+        if (iD < iBestD) { iBestD = iD; iBest = iIdx; }
+        if (pLut[iCell].aiDist[k] == 0x3fffffff)
+            break; // no further valid candidates
+    }
+    return iBest;
+}
+
+//
+// Quantize an RGB888 bitmap into an indexed image.
+//
+// pPixels   : iWidth * iHeight * 3 bytes of source RGB data (R first)
+// iMaxColors: palette size limit, clamped internally to [1, 256]
+// bDither   : non-zero enables Floyd-Steinberg error diffusion
+// pPalette  : output buffer of at least 3*iMaxColors bytes (RGB888 triplets,
+//             GIF color-table layout). Only the first 3*return-value bytes
+//             are valid.
+// pOut      : output buffer of iWidth*iHeight bytes (palette indices)
+// pStats    : optional error report; may be NULL
+//
+// Returns the number of palette entries (>= 1) on success, or a negative
+// GIF_* error code (-GIF_INVALID_PARAMETER / -GIF_ERROR_MEMORY) on failure.
+//
+int GIF_quantizeRGB888(const uint8_t *pPixels, int iWidth, int iHeight,
+                       int iMaxColors, int bDither,
+                       uint8_t *pPalette, uint8_t *pOut,
+                       GIF_QUANT_STATS *pStats)
+{
+    int i, x, y, iCh;
+    int iN, iCap, iShift, iDistinct, iBoxCount, iPaletteCount, bExact;
+    uint32_t *pHashKey = NULL;   // 0 = empty slot, otherwise packed RGB + 1
+    uint32_t *pHashCount = NULL;
+    gif_qcolor *pColors = NULL;
+    gif_qbox *pBoxes = NULL;
+    gif_q_cand *pLut = NULL;
+    int32_t *pErr = NULL;        // dither error rows (6 * iWidth ints)
+    uint32_t *pExactKey = NULL;  // exact-color table for the lossless path
+    int16_t *pExactIdx = NULL;
+    uint8_t ucUsed[256];
+
+    if (pPixels == NULL || pPalette == NULL || pOut == NULL ||
+        iWidth <= 0 || iHeight <= 0)
+        return -GIF_INVALID_PARAMETER;
+    if (iMaxColors <= 0) iMaxColors = 1;
+    if (iMaxColors > MAX_COLORS) iMaxColors = MAX_COLORS;
+
+    iN = iWidth * iHeight;
+
+    // Hash table capacity: next power of two >= 1.25 * pixel count,
+    // bounded so the worst-case footprint stays reasonable.
+    iCap = 64;
+    while (iCap < iN + (iN >> 2) && iCap < GIF_Q_HASH_MAX)
+        iCap <<= 1;
+    iShift = 0;
+    {
+        uint64_t u64Span = (uint64_t)iCap;
+        while ((1ULL << (32 - iShift)) > u64Span) // shift to index the multiplicative hash
+            iShift++;
+    }
+
+    pHashKey = (uint32_t *)calloc((size_t)iCap, sizeof(uint32_t));
+    pHashCount = (uint32_t *)calloc((size_t)iCap, sizeof(uint32_t));
+    pColors = (gif_qcolor *)malloc((size_t)iN * sizeof(gif_qcolor));
+    pBoxes = (gif_qbox *)malloc((size_t)iMaxColors * sizeof(gif_qbox));
+    pLut = (gif_q_cand *)malloc((size_t)GIF_Q_LUT_CELLS * sizeof(gif_q_cand));
+    // 512 slots keep a <=256-entry exact table at <=50% load
+    pExactKey = (uint32_t *)calloc(512, sizeof(uint32_t));
+    pExactIdx = (int16_t *)malloc(512 * sizeof(int16_t));
+    if (pHashKey == NULL || pHashCount == NULL || pColors == NULL ||
+        pBoxes == NULL || pLut == NULL ||
+        pExactKey == NULL || pExactIdx == NULL)
+    {
+        free(pHashKey); free(pHashCount); free(pColors);
+        free(pBoxes); free(pLut);
+        free(pExactKey); free(pExactIdx);
+        return -GIF_ERROR_MEMORY;
+    }
+    if (bDither)
+    {
+        pErr = (int32_t *)calloc((size_t)(6 * iWidth), sizeof(int32_t));
+        if (pErr == NULL)
+        {
+            free(pHashKey); free(pHashCount); free(pColors);
+            free(pBoxes); free(pLut);
+            free(pExactKey); free(pExactIdx);
+            return -GIF_ERROR_MEMORY;
+        }
+    }
+
+    //
+    // 1. Build the distinct-color histogram
+    //
+    iDistinct = 0;
+    for (i = 0; i < iN; i++)
+    {
+        const uint8_t *p = pPixels + i * 3;
+        uint32_t u32Stored = gif_q_key(p[0], p[1], p[2]) + 1;
+        uint32_t u32Slot = (u32Stored * 2654435761u) >> iShift;
+        while (pHashKey[u32Slot] != 0 && pHashKey[u32Slot] != u32Stored)
+            u32Slot = (u32Slot + 1) & (iCap - 1);
+        if (pHashKey[u32Slot] == 0)
+        {
+            uint32_t u32Key = u32Stored - 1;
+            pHashKey[u32Slot] = u32Stored;
+            pHashCount[u32Slot] = 1;
+            pColors[iDistinct].r = gif_q_r(u32Key);
+            pColors[iDistinct].g = gif_q_g(u32Key);
+            pColors[iDistinct].b = gif_q_b(u32Key);
+            pColors[iDistinct].pad = 0;
+            pColors[iDistinct].u32Count = 1;
+            iDistinct++;
+        }
+        else
+        {
+            pHashCount[u32Slot]++;
+        }
+    }
+    // Transfer population counts from the hash table into the color array.
+    for (i = 0; i < iDistinct; i++)
+    {
+        uint32_t u32Stored = gif_q_key(pColors[i].r, pColors[i].g, pColors[i].b) + 1;
+        uint32_t u32Slot = (u32Stored * 2654435761u) >> iShift;
+        while (pHashKey[u32Slot] != u32Stored)
+            u32Slot = (u32Slot + 1) & (iCap - 1);
+        pColors[i].u32Count = pHashCount[u32Slot];
+    }
+    free(pHashKey);
+    free(pHashCount);
+
+    iPaletteCount = iDistinct < iMaxColors ? iDistinct : iMaxColors;
+    iBoxCount = 0;
+    bExact = (iDistinct <= iMaxColors);
+
+    if (bExact)
+    {
+        //
+        // 2a. Already within the palette limit: exact representation,
+        //     no information loss and no point in dithering.
+        //
+        for (i = 0; i < iDistinct; i++)
+        {
+            pPalette[i * 3] = pColors[i].r;
+            pPalette[i * 3 + 1] = pColors[i].g;
+            pPalette[i * 3 + 2] = pColors[i].b;
+        }
+        bDither = 0;
+        // Exact lookup table so palette indices map back without any
+        // 5-bits/channel grid aliasing (guarantees zero quantization error).
+        for (i = 0; i < iDistinct; i++)
+        {
+            uint32_t u32Stored = gif_q_key(pColors[i].r, pColors[i].g, pColors[i].b) + 1;
+            uint32_t u32Slot = (u32Stored * 2654435761u) % 512u;
+            while (pExactKey[u32Slot] != 0 && pExactKey[u32Slot] != u32Stored)
+                u32Slot = (u32Slot + 1) & 511;
+            pExactKey[u32Slot] = u32Stored;
+            pExactIdx[u32Slot] = (int16_t)i;
+        }
+    }
+    else
+    {
+        //
+        // 2b. Median cut: repeatedly split the population-weighted box with
+        //     the widest channel range at its weighted median.
+        //
+        uint32_t u32Hist[256];
+        pBoxes[0].iStart = 0;
+        pBoxes[0].iCount = iDistinct;
+        gif_q_measure(&pBoxes[0], pColors);
+        iBoxCount = 1;
+        while (iBoxCount < iMaxColors)
+        {
+            int iBest = -1, iBestRange = 0, iBestCh = 0;
+            gif_qbox *pBox, box0, box1;
+            uint32_t u32Total, u32Acc, u32Median;
+            int iValue, iLeft, iRight, i;
+
+            for (i = 0; i < iBoxCount; i++)
+            {
+                if (pBoxes[i].iCount < 2)
+                    continue;
+                for (iCh = 0; iCh < 3; iCh++)
+                {
+                    int iRange = pBoxes[i].iMax[iCh] - pBoxes[i].iMin[iCh];
+                    if (iRange > iBestRange)
+                    {
+                        iBestRange = iRange;
+                        iBestCh = iCh;
+                        iBest = i;
+                    }
+                }
+            }
+            if (iBest < 0)
+                break; // every remaining box holds a single distinct color
+
+            pBox = &pBoxes[iBest];
+            memset(u32Hist, 0, sizeof(u32Hist));
+            u32Total = 0;
+            for (i = 0; i < pBox->iCount; i++)
+            {
+                uint8_t ucVal = gif_q_channel(&pColors[pBox->iStart + i], iBestCh);
+                u32Hist[ucVal] += pColors[pBox->iStart + i].u32Count;
+                u32Total += pColors[pBox->iStart + i].u32Count;
+            }
+            // Split value: lowest channel value whose cumulative population
+            // reaches the weighted median. The range is non-empty, so a value
+            // strictly inside the range exists and both halves stay non-empty.
+            u32Median = (u32Total + 1) / 2;
+            u32Acc = 0;
+            iValue = pBox->iMin[iBestCh] + 1;
+            for (i = pBox->iMin[iBestCh]; i <= pBox->iMax[iBestCh]; i++)
+            {
+                u32Acc += u32Hist[i];
+                if (u32Acc >= u32Median)
+                {
+                    iValue = i + 1;
+                    if (iValue > pBox->iMax[iBestCh])
+                        iValue = pBox->iMax[iBestCh];
+                    break;
+                }
+            }
+
+            iLeft = gif_q_partition(pColors, pBox->iStart, pBox->iCount,
+                                    iBestCh, iValue);
+            iRight = pBox->iCount - iLeft;
+            box0.iStart = pBox->iStart;
+            box0.iCount = iLeft;
+            box1.iStart = pBox->iStart + iLeft;
+            box1.iCount = iRight;
+            gif_q_measure(&box0, pColors);
+            gif_q_measure(&box1, pColors);
+            *pBox = box0;
+            pBoxes[iBoxCount++] = box1;
+        }
+
+        //
+        // 3. One palette entry per box: population-weighted average RGB,
+        //    which minimizes squared error for the box's members.
+        //
+        for (i = 0; i < iBoxCount; i++)
+        {
+            uint32_t u32SumR = 0, u32SumG = 0, u32SumB = 0;
+            int k;
+            for (k = 0; k < pBoxes[i].iCount; k++)
+            {
+                const gif_qcolor *pC = &pColors[pBoxes[i].iStart + k];
+                u32SumR += (uint32_t)pC->r * pC->u32Count;
+                u32SumG += (uint32_t)pC->g * pC->u32Count;
+                u32SumB += (uint32_t)pC->b * pC->u32Count;
+            }
+            pPalette[i * 3] = (uint8_t)((u32SumR + pBoxes[i].u32Pixels / 2) / pBoxes[i].u32Pixels);
+            pPalette[i * 3 + 1] = (uint8_t)((u32SumG + pBoxes[i].u32Pixels / 2) / pBoxes[i].u32Pixels);
+            pPalette[i * 3 + 2] = (uint8_t)((u32SumB + pBoxes[i].u32Pixels / 2) / pBoxes[i].u32Pixels);
+        }
+        iPaletteCount = iBoxCount;
+    }
+    free(pBoxes);
+    free(pColors);
+
+    //
+    // 4. Nearest-palette lookup grid (32x32x32, 5 bits/channel) holding a
+    //    few nearest candidates per cell. The lossless (exact) path uses a
+    //    full-precision hash table instead.
+    //
+    if (!bExact)
+    {
+        gif_q_build_lut(pPalette, iPaletteCount, pLut);
+    }
+
+    memset(ucUsed, 0, sizeof(ucUsed));
+
+    //
+    // 5. Map every pixel to a palette index, optionally with
+    //    Floyd-Steinberg error diffusion (7/16, 3/16, 5/16, 1/16).
+    //    Errors are stored in 4:12 fixed point (value << 12).
+    //
+    if (bExact)
+    {
+        // Exact-color hash lookup: every source color is a palette entry.
+        for (i = 0; i < iN; i++)
+        {
+            const uint8_t *p = pPixels + i * 3;
+            uint32_t u32Stored = gif_q_key(p[0], p[1], p[2]) + 1;
+            uint32_t u32Slot = (u32Stored * 2654435761u) % 512u;
+            while (pExactKey[u32Slot] != u32Stored)
+                u32Slot = (u32Slot + 1) & 511;
+            uint8_t ucIdx = (uint8_t)pExactIdx[u32Slot];
+            pOut[i] = ucIdx;
+            ucUsed[ucIdx] = 1;
+        }
+    }
+    else if (!bDither)
+    {
+        for (i = 0; i < iN; i++)
+        {
+            const uint8_t *p = pPixels + i * 3;
+            int iCell = ((p[0] >> 3) << (2 * GIF_Q_LUT_BITS)) |
+                        ((p[1] >> 3) << GIF_Q_LUT_BITS) | (p[2] >> 3);
+            uint8_t ucIdx = (uint8_t)gif_q_nearest(pLut, iCell, pPalette,
+                                                   p[0], p[1], p[2]);
+            pOut[i] = ucIdx;
+            ucUsed[ucIdx] = 1;
+        }
+    }
+    else
+    {
+        int32_t *pCur = pErr;             // current row errors, 3 channels
+        int32_t *pNext = pErr + 3 * iWidth;
+        for (y = 0; y < iHeight; y++)
+        {
+            for (x = 0; x < iWidth; x++)
+            {
+                const uint8_t *p = pPixels + (y * iWidth + x) * 3;
+                int iAdj[3], iCell, k;
+                uint8_t ucIdx;
+                for (k = 0; k < 3; k++)
+                {
+                    // pCur/pNext hold accumulated error in whole color units
+                    int i32V = (int)p[k] + pCur[x * 3 + k];
+                    iAdj[k] = i32V;
+                    if (iAdj[k] < 0) iAdj[k] = 0;
+                    if (iAdj[k] > 255) iAdj[k] = 255;
+                }
+                iCell = ((iAdj[0] >> 3) << (2 * GIF_Q_LUT_BITS)) |
+                        ((iAdj[1] >> 3) << GIF_Q_LUT_BITS) | (iAdj[2] >> 3);
+                ucIdx = (uint8_t)gif_q_nearest(pLut, iCell, pPalette,
+                                                iAdj[0], iAdj[1], iAdj[2]);
+                pOut[y * iWidth + x] = ucIdx;
+                ucUsed[ucIdx] = 1;
+                for (k = 0; k < 3; k++)
+                {
+                    // Integer-domain Floyd-Steinberg weights (7/16, 3/16,
+                    // 5/16, 1/16) with truncation; pCur/pNext accumulate whole
+                    // color-unit errors, so no fixed-point scaling is needed.
+                    int iErr = iAdj[k] - (int)pPalette[ucIdx * 3 + k];
+                    if (x + 1 < iWidth)
+                        pCur[(x + 1) * 3 + k] += (iErr * 7) / 16;
+                    if (y + 1 < iHeight)
+                    {
+                        if (x > 0)
+                            pNext[(x - 1) * 3 + k] += (iErr * 3) / 16;
+                        pNext[x * 3 + k] += (iErr * 5) / 16;
+                        if (x + 1 < iWidth)
+                            pNext[(x + 1) * 3 + k] += iErr / 16;
+                    }
+                }
+            }
+            // swap current/next row buffers and clear the new "next" row
+            {
+                int32_t *pTmp = pCur;
+                pCur = pNext;
+                pNext = pTmp;
+                memset(pNext, 0, (size_t)(3 * iWidth) * sizeof(int32_t));
+            }
+        }
+    }
+    free(pLut);
+    free(pErr);
+    free(pExactKey);
+    free(pExactIdx);
+
+    //
+    // 6. Quantization error report against the original pixels
+    //
+    if (pStats)
+    {
+        uint64_t u64SumSq = 0;
+        double dSumDist = 0.0;
+        int iUsed = 0;
+        for (i = 0; i < 256; i++)
+            iUsed += ucUsed[i];
+        for (i = 0; i < iN; i++)
+        {
+            const uint8_t *p = pPixels + i * 3;
+            uint8_t ucIdx = pOut[i];
+            int iDr = (int)p[0] - pPalette[ucIdx * 3];
+            int iDg = (int)p[1] - pPalette[ucIdx * 3 + 1];
+            int iDb = (int)p[2] - pPalette[ucIdx * 3 + 2];
+            u64SumSq += (uint64_t)(iDr * iDr + iDg * iDg + iDb * iDb);
+            dSumDist += sqrt((double)(iDr * iDr + iDg * iDg + iDb * iDb));
+        }
+        pStats->dMSE = (double)u64SumSq / (3.0 * iN);
+        pStats->dPSNR = (pStats->dMSE > 0.0)
+                        ? 10.0 * log10((255.0 * 255.0) / pStats->dMSE)
+                        : 99.99;
+        pStats->dMeanDeltaE = dSumDist / iN;
+        pStats->iPaletteCount = iPaletteCount;
+        pStats->iUsedColors = iUsed;
+        pStats->iDistinctInput = iDistinct;
+        pStats->bDithered = bDither ? 1 : 0;
+    }
+
+    return iPaletteCount;
+} /* GIF_quantizeRGB888() */
+
+#ifdef __cplusplus
+}
+#endif
+
 
